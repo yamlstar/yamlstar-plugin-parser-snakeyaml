@@ -1,0 +1,109 @@
+name: Release
+run-name: Release ${{ inputs.version }} from ${{ github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Reviewed version to publish
+        required: true
+        type: string
+      commit:
+        description: Reviewed commit, or leave empty for the selected ref
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parser-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_COMMIT: ${{ inputs.commit || github.sha }}
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        ref: ${{ inputs.commit || github.sha }}
+        persist-credentials: false
+    - name: Check reviewed source and version
+      id: source
+      run: |
+        [[ $RELEASE_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+        [[ $RELEASE_COMMIT =~ ^[0-9a-f]{40}$ ]]
+        test "$RELEASE_COMMIT" = "$GITHUB_SHA"
+        test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+        make check-versions VERSION="$RELEASE_VERSION"
+        echo "commit=$RELEASE_COMMIT" >> "$GITHUB_OUTPUT"
+
+  tests:
+    needs: prepare
+    uses: ./.github/workflows/test.yaml
+    with:
+      ref: ${{ needs.prepare.outputs.commit }}
+
+  native:
+    needs: prepare
+    uses: ./.github/workflows/native.yaml
+    with:
+      version: ${{ inputs.version }}
+      ref: ${{ needs.prepare.outputs.commit }}
+
+  publish:
+    needs: [prepare, tests, native]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: write
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+      GH_TOKEN: ${{ github.token }}
+      CENTRAL_TOKEN: ${{ secrets.CENTRAL_TOKEN }}
+      GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        ref: ${{ needs.prepare.outputs.commit }}
+        persist-credentials: false
+    - name: Check publishing credentials
+      run: |
+        for name in CENTRAL_TOKEN GPG_KEY_ID GPG_PRIVATE_KEY; do
+          if [[ -z ${!name} ]]; then
+            echo "Missing Actions secret: $name" >&2
+            exit 1
+          fi
+        done
+    - name: Import signing key
+      env:
+        GNUPGHOME: ${{ runner.temp }}/release-gnupg
+      run: |
+        install -d -m 700 "$GNUPGHOME"
+        printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+        gpg --batch --list-secret-keys "$GPG_KEY_ID" > /dev/null
+    - name: Publish Java, native, and Go artifacts
+      env:
+        GNUPGHOME: ${{ runner.temp }}/release-gnupg
+      run: make release-publish v="$RELEASE_VERSION"
+    - name: Remove signing key
+      if: always()
+      env:
+        GNUPGHOME: ${{ runner.temp }}/release-gnupg
+      run: |
+        gpgconf --kill gpg-agent || true
+        rm -rf "$GNUPGHOME"

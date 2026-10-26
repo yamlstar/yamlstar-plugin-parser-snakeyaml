@@ -146,9 +146,13 @@ release-check: check-versions $(PERL)
 	@test -z "$$(git status --porcelain)" || { \
 	  echo 'Commit reviewed release sources first' >&2; exit 1; }
 
-release: release-check $(MAVEN) $(PERL) $(YS) $(PYTHON) $(GH)
-	YS=$(YS) GH=$(GH) PERL=$(PERL) MAVEN=$(MAVEN) \
-	  MAVEN_REPOSITORY=$(MAVEN-REPOSITORY) $(PYTHON) util/release '$(v)'
+release: release-check $(YS) $(PYTHON) $(GH)
+	YS=$(YS) GH=$(GH) PERL=$(PERL) $(PYTHON) util/release '$(v)'
+
+release-publish: release-check $(MAVEN) $(PYTHON) $(GH)
+	GH=$(GH) PERL=$(PERL) MAVEN=$(MAVEN) \
+	  MAVEN_REPOSITORY=$(MAVEN-REPOSITORY) \
+	  $(PYTHON) util/release --publish '$(v)'
 
 test-release: $(PERL) $(YS) $(PYTHON)
 	YS=$(YS) $(PERL) test/maven-release.t

@@ -9,12 +9,24 @@ on:
         required: true
         default: 0.1.0
         type: string
+  workflow_call:
+    inputs:
+      version:
+        description: Reviewed version to build
+        required: true
+        type: string
+      ref:
+        description: Reviewed source commit
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
 
 env:
   RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_SHA: ${{ inputs.ref || github.sha }}
 
 defaults:
   run:
@@ -36,19 +48,21 @@ jobs:
     steps:
     - uses: actions/checkout@v5
       with:
-        ref: ${{ github.sha }}
+        ref: ${{ inputs.ref || github.sha }}
     - name: Check reviewed version
       run: |
         [[ $RELEASE_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-        test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+        [[ $RELEASE_SHA =~ ^[0-9a-f]{40}$ ]]
+        test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
         make check-versions VERSION="$RELEASE_VERSION"
-        echo "Release $RELEASE_VERSION from $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+        echo "Release $RELEASE_VERSION from $RELEASE_SHA" >> "$GITHUB_STEP_SUMMARY"
     - name: Test and package
       run: make dist test-goyaml-race test-graal-host
     - uses: actions/upload-artifact@v6
       with:
         name: native-${{ matrix.platform }}
         path: dist/*.tar.xz
+        overwrite: true
         retention-days: 14
 
   checksums:
@@ -57,7 +71,7 @@ jobs:
     steps:
     - uses: actions/download-artifact@v7
       with:
-        pattern: native-*
+        pattern: native-*-*
         merge-multiple: true
         path: dist
     - name: Combine checksums
@@ -73,4 +87,5 @@ jobs:
       with:
         name: native-release
         path: dist/*
+        overwrite: true
         retention-days: 14

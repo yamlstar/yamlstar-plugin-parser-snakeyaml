@@ -73,19 +73,13 @@ class Services:
         self.commit_error = None
         self.fail = None
         self.corrupt_download = False
-        self.artifacts_expired = False
-        self.edit_during_ci = False
+        self.edit_during_download = False
         self.missing_once = set()
         self.events = []
-        self.runs = {
-            'test.yaml': [self.run(10)],
-            'native.yaml': [self.run(20)],
-        }
-
-    @staticmethod
-    def run(number, status='completed', conclusion='success', head=HEAD):
-        return {'id': number, 'status': status, 'conclusion': conclusion,
-                'head_sha': head}
+        self.workflow_run = {'id': 20, 'head_sha': HEAD,
+                             'path': '.github/workflows/release.yaml'}
+        self.dispatch_arguments = None
+        self.release_runs = []
 
     def command(self, *args, payload=None, stream=False):
         if args[:3] == ('git', 'status', '--porcelain'):
@@ -110,23 +104,18 @@ class Services:
         args = args[1:-2]
         if args[:2] == ('workflow', 'run'):
             self.events.append('dispatch-' + args[2])
-            self.runs[args[2]].insert(0, self.run(30, 'queued', None))
-            self.artifacts_expired = False
-        elif args[:2] == ('run', 'watch'):
-            self.events.append('watch-' + args[2])
-            if self.edit_during_ci:
-                self.dirty = True
-            for runs in self.runs.values():
-                for run in runs:
-                    if str(run['id']) == args[2]:
-                        if self.fail == 'ci':
-                            raise module.ReleaseError('CI failed')
-                        run.update(status='completed', conclusion='success')
+            self.dispatch_arguments = args
+        elif args[:2] == ('run', 'rerun'):
+            self.events.append('rerun-' + args[2])
+            if '--failed' not in args:
+                raise AssertionError(args)
         elif args[:2] == ('run', 'download'):
             if self.fail == 'artifact':
                 raise module.ReleaseError('Artifact expired')
             destination = Path(args[args.index('--dir') + 1])
             shutil.copytree(self.fixtures, destination)
+            if self.edit_during_download:
+                self.dirty = True
         elif args[:2] == ('release', 'create'):
             self.events.append('github-draft')
             self.release = {'tag_name': VERSION, 'draft': True,
@@ -159,14 +148,12 @@ class Services:
                     if tag in self.references else [])
         if endpoint.startswith('git/tags/'):
             return {'object': self.tag_objects[endpoint.split('/')[-1]]}
-        if endpoint.startswith('actions/workflows/'):
-            return {'workflow_runs': self.runs[endpoint.split('/')[2]]}
-        if endpoint.endswith('/artifacts'):
-            return {'artifacts': [{'name': 'native-release',
-                                   'expired': self.artifacts_expired}]}
         if endpoint.startswith('actions/runs/'):
-            return next(run for runs in self.runs.values() for run in runs
-                        if str(run['id']) == endpoint.split('/')[-1])
+            if endpoint != 'actions/runs/20':
+                raise AssertionError(endpoint)
+            return self.workflow_run
+        if endpoint.startswith('actions/workflows/release.yaml/runs?'):
+            return {'workflow_runs': self.release_runs}
         if endpoint.startswith('releases?'):
             return [self.release] if self.release else []
         if endpoint == 'git/refs':
@@ -208,6 +195,11 @@ class ReleaseTests(unittest.TestCase):
             'GH': 'fixture-gh', 'GH_TOKEN': 'fixture-private-token',
             'PERL': 'fixture-perl', 'MAVEN': 'fixture-maven',
             'MAVEN_REPOSITORY': '/fixture/m2',
+            'GITHUB_ACTIONS': 'true', 'GITHUB_RUN_ID': '20',
+            'GITHUB_REPOSITORY': module.REPOSITORY,
+            'GITHUB_WORKFLOW_REF': (
+                module.REPOSITORY + '/.github/workflows/release.yaml@refs/heads/main'),
+            'RELEASE_COMMIT': HEAD,
         }, clear=True)
         environment.start()
         self.addCleanup(environment.stop)
@@ -322,39 +314,99 @@ class ReleaseTests(unittest.TestCase):
         self.assert_no_go_tag()
         self.assertIsNone(self.services.release)
 
-    def test_missing_ci_is_dispatched_and_waited_for(self):
-        self.services.runs['native.yaml'] = []
-        self.publish()
-        self.assertIn('dispatch-native.yaml', self.services.events)
-        self.assertIn('watch-30', self.services.events)
+    def test_local_command_only_dispatches_release_workflow(self):
+        del self.release.environment['MAVEN']
+        del self.release.environment['MAVEN_REPOSITORY']
+        with patch.object(module.sys, 'argv', ['util/release', VERSION]), \
+                patch.object(module, 'Release', return_value=self.release), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            module.main()
+        self.assertEqual(self.services.events, ['dispatch-release.yaml'])
+        self.assertIn('version=' + VERSION, self.services.dispatch_arguments)
+        self.assertIn('commit=' + HEAD, self.services.dispatch_arguments)
+        self.assertIn('/actions/workflows/release.yaml', output.getvalue())
+        self.assertFalse(self.release.assets.exists())
+        self.assert_no_go_tag()
 
-    def test_old_failed_run_is_not_confused_with_new_dispatch(self):
-        self.services.runs['native.yaml'] = [
-            self.services.run(20, conclusion='failure')]
-        self.publish()
-        self.assertIn('watch-30', self.services.events)
-        self.assertNotIn('watch-20', self.services.events)
+    def test_local_dispatch_rejects_a_different_remote_branch_tip(self):
+        self.services.remote_head = '2' * 40
+        with self.assertRaisesRegex(module.ReleaseError, 'does not match HEAD'):
+            self.release.dispatch()
+        self.assert_no_go_tag()
+        self.assertFalse(self.services.events)
 
-    def test_expired_native_artifacts_are_rebuilt(self):
-        self.services.artifacts_expired = True
-        self.publish()
-        self.assertIn('dispatch-native.yaml', self.services.events)
-        self.assertIn('watch-30', self.services.events)
+    def test_local_command_reuses_an_active_workflow_without_waiting(self):
+        self.services.release_runs = [{
+            'id': 20, 'head_sha': HEAD, 'status': 'in_progress',
+            'conclusion': None, 'html_url': 'https://github.com/fixture/runs/20',
+        }]
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.release.dispatch()
+        self.assertIn('already running', output.getvalue())
+        self.assertFalse(self.services.events)
 
-    def test_pending_ci_failure_stops_before_publishing(self):
-        self.services.runs['native.yaml'] = [
-            self.services.run(20, 'in_progress', None)]
-        self.services.fail = 'ci'
-        with self.assertRaisesRegex(module.ReleaseError, 'CI failed'):
+    def test_local_command_resumes_failed_jobs_without_waiting(self):
+        self.services.release_runs = [{
+            'id': 20, 'head_sha': HEAD, 'status': 'completed',
+            'conclusion': 'failure', 'html_url': 'https://github.com/fixture/runs/20',
+        }]
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.release.dispatch()
+        self.assertIn('restarted', output.getvalue())
+        self.assertEqual(self.services.events, ['rerun-20'])
+        self.assert_no_go_tag()
+
+    def test_local_command_does_not_restart_a_completed_release(self):
+        self.services.release_runs = [{
+            'id': 20, 'head_sha': HEAD, 'status': 'completed',
+            'conclusion': 'success', 'html_url': 'https://github.com/fixture/runs/20',
+        }]
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.release.dispatch()
+        self.assertIn('already completed', output.getvalue())
+        self.assertFalse(self.services.events)
+
+    def test_publication_runs_only_in_actions(self):
+        del self.release.environment['GITHUB_ACTIONS']
+        with self.assertRaisesRegex(module.ReleaseError, 'Publication runs in'):
+            self.publish()
+        self.assertFalse(self.services.events)
+
+    def test_publication_rejects_a_different_workflow(self):
+        self.release.environment['GITHUB_WORKFLOW_REF'] = (
+            module.REPOSITORY + '/.github/workflows/test.yaml@refs/heads/main')
+        with self.assertRaisesRegex(module.ReleaseError, 'Publication runs in'):
+            self.publish()
+        self.assertFalse(self.services.events)
+
+    def test_workflow_for_another_commit_is_not_accepted(self):
+        self.services.workflow_run['head_sha'] = '2' * 40
+        with self.assertRaisesRegex(module.ReleaseError,
+                                    'does not match the reviewed'):
             self.publish()
         self.assert_no_go_tag()
         self.assertIsNone(self.services.release)
 
-    def test_ci_for_another_commit_is_not_accepted(self):
-        self.services.runs['native.yaml'] = [self.services.run(20, head='2' * 40)]
-        self.services.remote_head = '2' * 40
-        with self.assertRaisesRegex(module.ReleaseError, 'does not match HEAD'):
+    def test_workflow_input_must_match_checkout(self):
+        self.release.environment['RELEASE_COMMIT'] = '2' * 40
+        with self.assertRaisesRegex(module.ReleaseError,
+                                    'does not match the reviewed'):
             self.publish()
+        self.assert_no_go_tag()
+
+    def test_publish_cli_uses_actions_mode(self):
+        arguments = ['util/release', '--publish', VERSION]
+        with patch.object(module.sys, 'argv', arguments), \
+                patch.object(module, 'Release', return_value=self.release), \
+                contextlib.redirect_stdout(io.StringIO()):
+            module.main()
+        self.assertEqual(self.services.events[-1], 'go-tag')
+
+    def test_missing_workflow_artifact_stops_before_publication(self):
+        self.services.fail = 'artifact'
+        with self.assertRaisesRegex(module.ReleaseError, 'Artifact expired'):
+            self.publish()
+        self.assertIsNone(self.services.release)
         self.assert_no_go_tag()
 
     def test_conflicting_remote_tag_is_not_replaced(self):
@@ -396,10 +448,8 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn('is not on GitHub', str(raised.exception))
         self.assertFalse(self.services.events)
 
-    def test_checkout_changes_during_ci_stop_before_publication(self):
-        self.services.runs['native.yaml'] = [
-            self.services.run(20, 'in_progress', None)]
-        self.services.edit_during_ci = True
+    def test_checkout_changes_during_validation_stop_before_publication(self):
+        self.services.edit_during_download = True
         with self.assertRaisesRegex(module.ReleaseError, 'checkout changed'):
             self.publish()
         self.assert_no_go_tag()

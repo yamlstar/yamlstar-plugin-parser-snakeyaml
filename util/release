@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish the Java, native, and Go releases in dependency order."""
+"""Start the release workflow, or publish its validated artifacts in Actions."""
 
 import hashlib
 import json
@@ -89,58 +89,6 @@ class Release:
         if obj['type'] != 'commit' or obj['sha'] != self.head:
             raise ReleaseError(f'Tag {tag} does not match release commit {self.head}')
         return obj['sha']
-
-    def ensure_ci(self, workflow):
-        endpoint = (f'actions/workflows/{workflow}/runs?'
-                    f'head_sha={self.head}&per_page=100')
-
-        def runs():
-            return [run for run in self.api(endpoint)['workflow_runs']
-                    if run['head_sha'] == self.head]
-
-        available = runs()
-        def usable(run):
-            if run['conclusion'] != 'success' or run['status'] != 'completed':
-                return False
-            if workflow != 'native.yaml':
-                return True
-            artifacts = self.api(f'actions/runs/{run["id"]}/artifacts')['artifacts']
-            return any(item['name'] == 'native-release' and not item['expired']
-                       for item in artifacts)
-
-        successful = next((run for run in available if usable(run)), None)
-        if successful:
-            return successful['id']
-        pending = next((run for run in available
-                        if run['status'] != 'completed'), None)
-        if pending is None:
-            previous = {run['id'] for run in available}
-            branch = self.command('git', 'branch', '--show-current')
-            if not branch:
-                raise ReleaseError('Run the release from a published branch')
-            remote = self.api('commits/' + quote(branch, safe=''))
-            if remote['sha'] != self.head:
-                raise ReleaseError('The release branch on GitHub does not match HEAD')
-            arguments = ['workflow', 'run', workflow, '--ref', branch]
-            if workflow == 'native.yaml':
-                arguments += ['--field', 'version=' + self.version]
-            self.github(*arguments)
-            deadline = time.monotonic() + WAIT_SECONDS
-            while pending is None:
-                available = runs()
-                pending = next((run for run in available
-                                if run['id'] not in previous), None)
-                if pending is not None:
-                    break
-                if time.monotonic() >= deadline:
-                    raise ReleaseError(f'No {workflow} run appeared for {self.head}')
-                time.sleep(POLL_SECONDS)
-        self.github('run', 'watch', str(pending['id']), '--exit-status')
-        run = self.api('actions/runs/' + str(pending['id']))
-        if (run['head_sha'] != self.head or run['status'] != 'completed'
-                or run['conclusion'] != 'success'):
-            raise ReleaseError(f'{workflow} did not pass at the release commit')
-        return run['id']
 
     def verify_assets(self, directory):
         if {path.name for path in directory.iterdir()} != set(self.filenames):
@@ -234,7 +182,7 @@ class Release:
                 raise ReleaseError('Timed out waiting for public release downloads')
             time.sleep(POLL_SECONDS)
 
-    def publish(self):
+    def preflight(self):
         if self.command('git', 'status', '--porcelain'):
             raise ReleaseError('Commit reviewed release sources first')
         self.command(self.environment.get('PERL', 'perl'),
@@ -256,12 +204,58 @@ class Release:
                 'No artifacts or tags were published.')
         for tag in (self.version, 'v' + self.version):
             self.tag_commit(tag)
-        test_run = self.ensure_ci('test.yaml')
-        native_run = self.ensure_ci('native.yaml')
-        self.download_assets(native_run)
+
+    def dispatch(self):
+        self.preflight()
+        branch = self.command('git', 'branch', '--show-current')
+        if not branch:
+            raise ReleaseError('Start the release from a published branch')
+        remote = self.api('commits/' + quote(branch, safe=''))
+        if remote['sha'] != self.head:
+            raise ReleaseError('The release branch on GitHub does not match HEAD')
+        runs = self.api('actions/workflows/release.yaml/runs?'
+                        f'head_sha={self.head}&per_page=100')['workflow_runs']
+        matching = [run for run in runs if run['head_sha'] == self.head]
+        active = next((run for run in matching
+                       if run['status'] != 'completed'), None)
+        if active:
+            print(f'Release {self.version} is already running: {active["html_url"]}')
+            return
+        if matching and matching[0]['conclusion'] == 'failure':
+            previous = matching[0]
+            self.github('run', 'rerun', str(previous['id']), '--failed')
+            print(f'Release {self.version} restarted: {previous["html_url"]}')
+            return
+        if matching and matching[0]['conclusion'] == 'success':
+            print(f'Release {self.version} already completed: '
+                  f'{matching[0]["html_url"]}')
+            return
+        self.github('workflow', 'run', 'release.yaml', '--ref', branch,
+                    '--field', 'version=' + self.version,
+                    '--field', 'commit=' + self.head)
+        print(f'Release {self.version} started at {self.head}.')
+        print(f'https://github.com/{REPOSITORY}/actions/workflows/release.yaml')
+
+    def publish(self):
+        run_id = self.environment.get('GITHUB_RUN_ID', '')
+        workflow = self.environment.get('GITHUB_WORKFLOW_REF', '')
+        if (self.environment.get('GITHUB_ACTIONS') != 'true'
+                or self.environment.get('GITHUB_REPOSITORY') != REPOSITORY
+                or not re.fullmatch(r'[0-9]+', run_id)
+                or not workflow.startswith(
+                    REPOSITORY + '/.github/workflows/release.yaml@')):
+            raise ReleaseError(
+                'Publication runs in the Release workflow; use make release v=VERSION')
+        self.preflight()
+        run = self.api('actions/runs/' + run_id)
+        if (self.environment.get('RELEASE_COMMIT') != self.head
+                or run['head_sha'] != self.head
+                or run['path'] != '.github/workflows/release.yaml'):
+            raise ReleaseError('Release workflow does not match the reviewed commit')
+        self.download_assets(int(run_id))
         if (self.command('git', 'status', '--porcelain')
                 or self.command('git', 'rev-parse', 'HEAD') != self.head):
-            raise ReleaseError('The release checkout changed while waiting for CI')
+            raise ReleaseError('The release checkout changed during asset validation')
 
         releases = self.api('releases?per_page=100')
         release = next((item for item in releases
@@ -270,8 +264,7 @@ class Release:
             runs_url = f'https://github.com/{REPOSITORY}/actions/runs/'
             notes = (f'SnakeYAML parser {self.version}\n\nCommit: {self.head}\n'
                      f'Java: org.yamlstar:{ARTIFACT}:{self.version}\n'
-                     f'Tests: {runs_url}{test_run}\n'
-                     f'Native: {runs_url}{native_run}')
+                     f'Validation and publication: {runs_url}{run_id}')
             notes_file = self.assets.parent / f'{self.version}-notes.md'
             notes_file.write_text(notes + '\n')
             self.github('release', 'create', self.version, '--draft',
@@ -310,9 +303,12 @@ class Release:
 
 
 def main():
-    if len(sys.argv) != 2:
+    if len(sys.argv) == 2:
+        Release(sys.argv[1]).dispatch()
+    elif len(sys.argv) == 3 and sys.argv[1] == '--publish':
+        Release(sys.argv[2]).publish()
+    else:
         raise ReleaseError('Use make release v=VERSION')
-    Release(sys.argv[1]).publish()
 
 
 if __name__ == '__main__':
