@@ -241,8 +241,19 @@ class Release:
                      'util/check-versions', self.version)
         self.head = self.command('git', 'rev-parse', 'HEAD')
         self.credentials()
-        if self.api('commits/' + self.head)['sha'] != self.head:
-            raise ReleaseError('The release commit is not available on GitHub')
+        try:
+            commit = self.api('commits/' + self.head)
+        except ReleaseError as error:
+            if ('No commit found for SHA:' not in str(error)
+                    or '(HTTP 422)' not in str(error)):
+                raise
+            commit = None
+        if commit is None or commit['sha'] != self.head:
+            raise ReleaseError(
+                f'Local release commit {self.head[:7]} is not on GitHub.\n'
+                f'Make this reviewed commit available in {REPOSITORY}, then '
+                f'rerun make release v={self.version}.\n'
+                'No artifacts or tags were published.')
         for tag in (self.version, 'v' + self.version):
             self.tag_commit(tag)
         test_run = self.ensure_ci('test.yaml')

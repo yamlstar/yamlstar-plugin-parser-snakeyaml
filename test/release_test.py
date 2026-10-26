@@ -70,6 +70,7 @@ class Services:
         self.central = False
         self.dirty = False
         self.remote_head = HEAD
+        self.commit_error = None
         self.fail = None
         self.corrupt_download = False
         self.artifacts_expired = False
@@ -148,6 +149,8 @@ class Services:
 
     def api(self, endpoint, payload):
         if endpoint.startswith('commits/'):
+            if endpoint.endswith(HEAD) and self.commit_error:
+                raise module.ReleaseError(self.commit_error)
             ref = endpoint.split('/')[-1]
             return {'sha': ref if len(ref) == 40 else self.remote_head}
         if endpoint.startswith('git/matching-refs/tags/'):
@@ -371,6 +374,26 @@ class ReleaseTests(unittest.TestCase):
         self.services.dirty = True
         with self.assertRaisesRegex(module.ReleaseError, 'Commit reviewed'):
             self.publish()
+        self.assertFalse(self.services.events)
+
+    def test_missing_github_commit_explains_prerequisite_before_publication(self):
+        self.services.commit_error = (
+            f'gh failed: gh: No commit found for SHA: {HEAD} (HTTP 422)')
+        with self.assertRaises(module.ReleaseError) as raised:
+            self.publish()
+        message = str(raised.exception)
+        self.assertIn(f'Local release commit {HEAD[:7]} is not on GitHub', message)
+        self.assertIn('rerun make release v=0.1.0', message)
+        self.assertIn('No artifacts or tags were published', message)
+        self.assertFalse(self.services.events)
+        self.assertIsNone(self.services.release)
+        self.assert_no_go_tag()
+
+    def test_github_authentication_failure_is_not_reported_as_missing_commit(self):
+        self.services.commit_error = 'gh: Bad credentials (HTTP 401)'
+        with self.assertRaisesRegex(module.ReleaseError, 'Bad credentials') as raised:
+            self.publish()
+        self.assertNotIn('is not on GitHub', str(raised.exception))
         self.assertFalse(self.services.events)
 
     def test_checkout_changes_during_ci_stop_before_publication(self):

@@ -4,6 +4,10 @@
 
 Publish `org.yamlstar:snakeyaml-engine:3.2.0` before releasing this plugin.
 The plugin release must be a reviewed, clean commit available on GitHub.
+Make the reviewed source commit available there before running `make release`.
+The command publishes artifacts and release tags from that source commit.
+If GitHub reports that the commit is missing, no release publication has
+started; make the commit available and rerun the command.
 Use the same version in the POM, Makefile, Java `VERSION`, C manifest,
 `plugin.edn`, and Go `Version`.
 
