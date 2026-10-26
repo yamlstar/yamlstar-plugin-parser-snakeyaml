@@ -1,0 +1,10 @@
+github.com/ebitengine/purego v0.10.2 h1:W809HbnvzAxgdm+aOvlSekrM16wGCdT/e76+9tS7gzE=
+github.com/ebitengine/purego v0.10.2/go.mod h1:iIjxzd6CiRiOG0UyXP+V1+jWqUXVjPKLAI0mRfJZTmQ=
+github.com/ulikunitz/xz v0.5.15 h1:9DNdB5s+SgV3bQ2ApL10xRc35ck0DuIX/isZvIk+ubY=
+github.com/ulikunitz/xz v0.5.15/go.mod h1:nbz6k7qbPmH4IRqmfOplQw/tblSgqTqBwxkY0oWt/14=
+github.com/yamlstar/yaml-events-binary-protocol v0.1.0 h1:4w5CCkr7ZCagMqcVEgRt7F68bFgRxMlVKkeyz/U4Oow=
+github.com/yamlstar/yaml-events-binary-protocol v0.1.0/go.mod h1:qgtcvO+n5hKb8TfAuAudQFYmzh8v6ejr/8GGYRiKe9k=
+go.yaml.in/yaml/v4 v4.0.0-rc.6.0.20261021023914-32734c39dedb h1:4WBDAmqld2VZtz2QmVWO6pQTklM9xYAK1/UJVcp8tMQ=
+go.yaml.in/yaml/v4 v4.0.0-rc.6.0.20261021023914-32734c39dedb/go.mod h1:aZqd9kCMsGL7AuUv/m/PvWLdg5sjJsZ4oHDEnfPPfY0=
+olympos.io/encoding/edn v0.0.0-20201019073823-d3554ca0b0a3 h1:slmdOY3vp8a7KQbHkL+FLbvbkgMqmXojpFUO/jENuqQ=
+olympos.io/encoding/edn v0.0.0-20201019073823-d3554ca0b0a3/go.mod h1:oVgVk4OWVDi43qWBEyGhXgYxt7+ED4iYNpTngSLX2Iw=

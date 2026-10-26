@@ -1,0 +1,107 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use File::Path qw(make_path);
+use File::Spec;
+use File::Temp qw(tempfile);
+use MIME::Base64 qw(decode_base64 encode_base64);
+
+sub fail { die "$_[0]\n" }
+
+my $mode = shift @ARGV // '';
+if ($mode eq 'check-version') {
+    my $version = shift @ARGV // '';
+    $version =~ /^\d+\.\d+\.\d+$/
+        or fail('Use make release v=VERSION');
+    open my $pom, '<', 'pom.xml' or fail("pom.xml: $!");
+    local $/;
+    my $source = <$pom>;
+    close $pom or fail("pom.xml: $!");
+    my ($current) = $source =~ m{<version>\s*([^<]+)\s*</version>};
+    defined $current && $current eq $version
+        or fail("Requested version $version does not match pom.xml");
+    exit 0;
+}
+
+$mode =~ /^(?:bundle|release)$/
+    or fail('Usage: maven-release bundle|release MAVEN REPOSITORY [FLAGS]');
+my ($maven, $repository, @flags) = @ARGV;
+defined $maven && defined $repository or fail('Missing Maven arguments');
+my $secrets = $ENV{YS_SECRETS_FILE}
+    // File::Spec->catfile($ENV{HOME}, '.yamlstar-secrets.yaml');
+my $ys = $ENV{YS} // 'ys';
+
+sub secret {
+    my ($field) = @_;
+    return '' unless -r $secrets;
+    my $pid = open my $output, '-|';
+    defined $pid or fail('Cannot start YAMLScript credential reader');
+    if (!$pid) {
+        open STDERR, '>', File::Spec->devnull or exit 127;
+        exec {$ys} $ys, '-e', "(stream():last.$field || \"\"):say", $secrets
+            or exit 127;
+    }
+    local $/;
+    my $value = <$output> // '';
+    close $output or fail("Cannot read $field from $secrets");
+    $value =~ s/\n\z//;
+    return $value;
+}
+
+my $token = $ENV{CENTRAL_TOKEN}
+    || secret('java.token') || secret('central.token');
+my $key = $ENV{GPG_KEY_ID} || secret('gpg.key-id');
+length $key or fail("Set gpg.key-id in $secrets or GPG_KEY_ID");
+$ENV{GPG_KEY_ID} = $key;
+if (!exists $ENV{MAVEN_GPG_PASSPHRASE}) {
+    my $passphrase = $ENV{GPG_PASSPHRASE} // secret('gpg.passphrase');
+    $ENV{MAVEN_GPG_PASSPHRASE} = $passphrase if length $passphrase;
+}
+
+my $server = '';
+if (length $token) {
+    $token =~ s/\s+//g;
+    $token =~ /^[A-Za-z0-9+\/]+={0,2}$/
+        or fail('Central token must be base64-encoded username:password');
+    my $decoded = decode_base64($token);
+    my $canonical = encode_base64($decoded, '');
+    $canonical =~ s/=+\z//;
+    (my $unpadded = $token) =~ s/=+\z//;
+    my ($username, $password) = split /:/, $decoded, 2;
+    $canonical eq $unpadded && length($username // '')
+        && length($password // '')
+        or fail('Central token must be base64-encoded username:password');
+    $ENV{YAMLSTAR_CENTRAL_USERNAME} = $username;
+    $ENV{YAMLSTAR_CENTRAL_PASSWORD} = $password;
+    $server = <<'XML';
+  <servers><server>
+    <id>central</id>
+    <username>${env.YAMLSTAR_CENTRAL_USERNAME}</username>
+    <password>${env.YAMLSTAR_CENTRAL_PASSWORD}</password>
+  </server></servers>
+XML
+} elsif ($mode eq 'release') {
+    fail("Set java.token or central.token in $secrets or CENTRAL_TOKEN");
+}
+
+make_path('.cache');
+my ($settings, $path) = tempfile(
+    'maven-release-settings-XXXXXX', DIR => '.cache', UNLINK => 1);
+print {$settings} "<settings>\n", $server, <<'XML';
+  <profiles><profile>
+    <id>yamlstar-release</id>
+    <properties><gpg.keyname>${env.GPG_KEY_ID}</gpg.keyname></properties>
+  </profile></profiles>
+  <activeProfiles><activeProfile>yamlstar-release</activeProfile></activeProfiles>
+</settings>
+XML
+close $settings or fail('Cannot write temporary Maven settings');
+
+my @command = ($maven, '--batch-mode', '--no-transfer-progress',
+    "-Dmaven.repo.local=$repository", '--settings', $path,
+    'deploy', '-Prelease', @flags,
+    '-Dcentral.skipUpload=' . ($mode eq 'bundle' ? 'true' : 'false'));
+system {$maven} @command;
+my $status = $?;
+$status == -1 and fail('Cannot start Maven');
+exit($status & 127 ? 128 + ($status & 127) : $status >> 8);

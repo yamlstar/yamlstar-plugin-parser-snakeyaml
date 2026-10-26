@@ -1,0 +1,6 @@
+{:abi 2
+ :api "yaml-parser"
+ :name "snakeyaml"
+ :version "0.1.0"
+ :kind "event-source"
+ :event-format "yamlstar-events-edn-v1"}

@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+go=${GO:?GO must name the project-managed Go}
+perl=${PERL:?PERL must name the project-managed Perl}
+python=${PYTHON:?PYTHON must name the project-managed Python}
+source=${GO_YAML_DIR:-../go-yaml}
+[[ -f $source/util/build-cli/main.go ]] || {
+  echo "Missing go-yaml checkout: $source" >&2
+  exit 1
+}
+root=$PWD
+work=$root/.cache/integration/goyaml-cli
+module=github.com/yamlstar/yamlstar-plugin-parser-snakeyaml
+export GOPROXY=file://$work/proxy,https://proxy.golang.org
+export GONOSUMDB=$module
+export GOMODCACHE=$work/modcache
+mkdir -p "$work"
+
+# Build from disposable sources so tests leave the developer's CLI intact.
+"$python" - "$source" "$work" "$module" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import zipfile
+
+source, work = (Path(arg).resolve() for arg in sys.argv[1:3])
+module = sys.argv[3]
+stage = work / 'source'
+if stage.exists():
+    shutil.rmtree(stage)
+stage.mkdir()
+files = subprocess.check_output(
+    ['git', '-C', str(source), 'ls-files', '-z'], text=True).split('\0')
+for name in filter(None, files):
+    original = source / name
+    if original.is_file():
+        target = stage / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(original, target)
+files = [Path('go.mod'), Path('go.sum'), Path('License')]
+files += sorted(Path('goyaml').rglob('*.go'))
+digest = hashlib.sha256()
+for file in files:
+    digest.update(file.as_posix().encode())
+    digest.update(file.read_bytes())
+version = 'v0.0.0-cli-' + digest.hexdigest()[:16]
+(work / 'version').write_text(version)
+proxy = work / 'proxy' / module / '@v'
+proxy.mkdir(parents=True, exist_ok=True)
+with zipfile.ZipFile(proxy / (version + '.zip'), 'w',
+                     zipfile.ZIP_DEFLATED) as archive:
+    for file in files:
+        archive.write(file, module + '@' + version + '/' + file.as_posix())
+(proxy / (version + '.mod')).write_bytes(Path('go.mod').read_bytes())
+(proxy / (version + '.info')).write_text(json.dumps({
+    'Version': version, 'Time': '2000-01-01T00:00:00Z'}))
+(proxy / 'list').write_text(version + '\n')
+
+PY
+
+version=$(< "$work/version")
+
+(
+  cd "$work/source"
+  GO_YAML_BUILD_GO=$go GO_YAML_BUILD_PERL=$perl \
+    GO_YAML_BUILD_CONFIG='' GO_YAML_BUILD_PLUGIN='' \
+    GO_YAML_BUILD_PLUGIN_PACKAGE=$module/goyaml@$version \
+    "$go" run ./util/build-cli
+)
+GO_YAML_CLI=$work/source/go-yaml CGO_ENABLED=0 \
+  "$go" test ./goyaml -run '^TestCLI$' -count=1 -v
+
+# Select the adapter as the built-in default through the same generic mechanism.
+(
+  cd "$work/source"
+  GO_YAML_BUILD_GO=$go GO_YAML_BUILD_PERL=$perl \
+    GO_YAML_BUILD_CONFIG='' GO_YAML_BUILD_PLUGIN=yaml-parser=snakeyaml \
+    GO_YAML_BUILD_PLUGIN_PACKAGE=$module/goyaml@$version \
+    "$go" run ./util/build-cli
+)
+GO_YAML_CLI=$work/source/go-yaml CGO_ENABLED=0 \
+  "$go" test ./goyaml -run '^TestSelectedCLI$' -count=1 -v

@@ -1,0 +1,26 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+my $version = shift @ARGV // die "Usage: check-versions VERSION\n";
+$version =~ /^\d+\.\d+\.\d+$/ or die "Invalid version: $version\n";
+my @checks = (
+    ['Makefile', "VERSION := $version"],
+    ['pom.xml', "<version>$version</version>"],
+    ['plugin.edn', qq{:version "$version"}],
+    ['src/main/java/org/yamlstar/snakeyaml/SnakeYamlParser.java',
+        qq{VERSION = "$version"}],
+    ['goyaml/plugin.go', qq{Version = "$version"}],
+    ['native/shim.c', qq{:version "$version"}],
+);
+for my $check (@checks) {
+    my ($path, $expected) = @$check;
+    open my $file, '<', $path or die "$path: $!\n";
+    local $/;
+    my $source = <$file>;
+    close $file or die "$path: $!\n";
+    $source =~ s/\\"/"/g;
+    index($source, $expected) >= 0
+        or die "$path does not match release version $version\n";
+}
+print "Release version $version is consistent\n";

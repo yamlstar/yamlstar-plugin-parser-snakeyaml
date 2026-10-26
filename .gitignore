@@ -1,0 +1,7 @@
+/.cache/
+/target/
+/lib/
+/dist/
+/go.work
+/go.work.sum
+!/Releasing.md
