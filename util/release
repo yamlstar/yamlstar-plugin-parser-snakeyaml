@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Publish the Java, native, and Go releases in dependency order."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+
+REPOSITORY = 'yamlstar/yamlstar-plugin-parser-snakeyaml'
+ARTIFACT = 'yamlstar-plugin-parser-snakeyaml'
+PLATFORMS = ('linux-x64', 'linux-aarch64', 'macos-arm64')
+WAIT_SECONDS = 1800
+POLL_SECONDS = 10
+
+
+class ReleaseError(Exception):
+    pass
+
+
+class Release:
+    def __init__(self, version):
+        if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+            raise ReleaseError('Use make release v=VERSION')
+        self.version = version
+        self.environment = os.environ.copy()
+        self.gh = self.environment.get('GH', 'gh')
+        self.assets = Path('.cache/release-assets') / version
+        self.filenames = [f'{ARTIFACT}-{version}-{platform}.tar.xz'
+                          for platform in PLATFORMS] + ['SHA256SUMS']
+
+    def command(self, *args, payload=None, stream=False):
+        result = subprocess.run(
+            args, input=None if payload is None else json.dumps(payload),
+            text=True, env=self.environment, check=False,
+            stdout=None if stream else subprocess.PIPE,
+            stderr=None if stream else subprocess.PIPE)
+        if result.returncode:
+            detail = (result.stderr or '').strip()
+            raise ReleaseError(f'{args[0]} failed: {detail or result.returncode}')
+        return (result.stdout or '').strip()
+
+    def api(self, endpoint, payload=None):
+        args = [self.gh, 'api', f'repos/{REPOSITORY}/{endpoint}']
+        if payload is not None:
+            args += ['--method', 'POST', '--input', '-']
+        return json.loads(self.command(*args, payload=payload))
+
+    def github(self, *args):
+        return self.command(self.gh, *args, '--repo', REPOSITORY, stream=True)
+
+    def credentials(self):
+        if self.environment.get('GH_TOKEN') or self.environment.get('GITHUB_TOKEN'):
+            return
+        secrets = Path(self.environment.get(
+            'YS_SECRETS_FILE', str(Path.home() / '.yamlstar-secrets.yaml')))
+        if not secrets.is_file():
+            return
+        result = subprocess.run(
+            [self.environment.get('YS', 'ys'), '-e',
+             '(stream():last.github.token || ""):say', str(secrets)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, check=False, env=self.environment)
+        if result.returncode:
+            raise ReleaseError(f'Cannot read github.token from {secrets}')
+        token = result.stdout.rstrip('\n')
+        if token:
+            self.environment['GH_TOKEN'] = token
+
+    def tag_commit(self, tag):
+        refs = self.api('git/matching-refs/tags/' + quote(tag, safe=''))
+        ref = next((ref for ref in refs if ref['ref'] == 'refs/tags/' + tag), None)
+        if ref is None:
+            return None
+        obj = ref['object']
+        while obj['type'] == 'tag':
+            obj = self.api('git/tags/' + obj['sha'])['object']
+        if obj['type'] != 'commit' or obj['sha'] != self.head:
+            raise ReleaseError(f'Tag {tag} does not match release commit {self.head}')
+        return obj['sha']
+
+    def ensure_ci(self, workflow):
+        endpoint = (f'actions/workflows/{workflow}/runs?'
+                    f'head_sha={self.head}&per_page=100')
+
+        def runs():
+            return [run for run in self.api(endpoint)['workflow_runs']
+                    if run['head_sha'] == self.head]
+
+        available = runs()
+        def usable(run):
+            if run['conclusion'] != 'success' or run['status'] != 'completed':
+                return False
+            if workflow != 'native.yaml':
+                return True
+            artifacts = self.api(f'actions/runs/{run["id"]}/artifacts')['artifacts']
+            return any(item['name'] == 'native-release' and not item['expired']
+                       for item in artifacts)
+
+        successful = next((run for run in available if usable(run)), None)
+        if successful:
+            return successful['id']
+        pending = next((run for run in available
+                        if run['status'] != 'completed'), None)
+        if pending is None:
+            previous = {run['id'] for run in available}
+            branch = self.command('git', 'branch', '--show-current')
+            if not branch:
+                raise ReleaseError('Run the release from a published branch')
+            remote = self.api('commits/' + quote(branch, safe=''))
+            if remote['sha'] != self.head:
+                raise ReleaseError('The release branch on GitHub does not match HEAD')
+            arguments = ['workflow', 'run', workflow, '--ref', branch]
+            if workflow == 'native.yaml':
+                arguments += ['--field', 'version=' + self.version]
+            self.github(*arguments)
+            deadline = time.monotonic() + WAIT_SECONDS
+            while pending is None:
+                available = runs()
+                pending = next((run for run in available
+                                if run['id'] not in previous), None)
+                if pending is not None:
+                    break
+                if time.monotonic() >= deadline:
+                    raise ReleaseError(f'No {workflow} run appeared for {self.head}')
+                time.sleep(POLL_SECONDS)
+        self.github('run', 'watch', str(pending['id']), '--exit-status')
+        run = self.api('actions/runs/' + str(pending['id']))
+        if (run['head_sha'] != self.head or run['status'] != 'completed'
+                or run['conclusion'] != 'success'):
+            raise ReleaseError(f'{workflow} did not pass at the release commit')
+        return run['id']
+
+    def verify_assets(self, directory):
+        if {path.name for path in directory.iterdir()} != set(self.filenames):
+            raise ReleaseError(
+                'Native release must contain all three archives and SHA256SUMS')
+        entries = (directory / 'SHA256SUMS').read_text().splitlines()
+        checksums = {}
+        for line in entries:
+            fields = line.split()
+            if (len(fields) != 2 or not re.fullmatch(r'[0-9a-f]{64}', fields[0])
+                    or fields[1] not in self.filenames[:-1]
+                    or fields[1] in checksums):
+                raise ReleaseError('Invalid combined SHA256SUMS')
+            checksums[fields[1]] = fields[0]
+        if set(checksums) != set(self.filenames[:-1]):
+            raise ReleaseError('SHA256SUMS must cover all three platforms')
+        for filename, digest in checksums.items():
+            actual = hashlib.sha256((directory / filename).read_bytes()).hexdigest()
+            if actual != digest:
+                raise ReleaseError(f'Checksum mismatch: {filename}')
+        for platform in PLATFORMS:
+            root = f'{ARTIFACT}-{self.version}-{platform}'
+            extension = '.dylib' if platform.startswith('macos') else '.so'
+            library = f'{root}/lib/lib{ARTIFACT}{extension}'
+            with tarfile.open(directory / (root + '.tar.xz'), 'r:xz') as archive:
+                members = archive.getmembers()
+                if any(not (member.isfile() or member.isdir()) for member in members):
+                    raise ReleaseError(
+                        'Native archive contains a link or special file')
+                manifest = archive.extractfile(root + '/plugin.edn').read().decode()
+                if (f':version "{self.version}"' not in manifest
+                        or ':abi 2' not in manifest
+                        or ':name "snakeyaml"' not in manifest):
+                    raise ReleaseError(f'Wrong native manifest in {root}')
+                for name in ('License', 'licenses/snakeyaml-engine.txt'):
+                    if not archive.getmember(root + '/' + name).isfile():
+                        raise ReleaseError(f'Missing license in {root}')
+                header = archive.extractfile(library).read(20)
+            if platform.startswith('linux'):
+                machine = 62 if platform == 'linux-x64' else 183
+                valid = (header[:6] == b'\x7fELF\x02\x01'
+                         and len(header) == 20
+                         and struct.unpack('<H', header[18:20])[0] == machine)
+            else:
+                valid = (len(header) >= 8 and struct.unpack('<II', header[:8])
+                         == (0xfeedfacf, 0x0100000c))
+            if not valid:
+                raise ReleaseError(f'Wrong native architecture in {root}')
+
+    def download_assets(self, run):
+        self.assets.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=self.assets.parent) as temporary:
+            directory = Path(temporary) / 'native-release'
+            self.github('run', 'download', str(run), '--name', 'native-release',
+                        '--dir', str(directory))
+            self.verify_assets(directory)
+            if self.assets.exists():
+                shutil.rmtree(self.assets)
+            directory.rename(self.assets)
+        provenance = {'commit': self.head, 'run': run, 'version': self.version}
+        (self.assets.parent / f'{self.version}-provenance.json').write_text(
+            json.dumps(provenance, indent=2) + '\n')
+
+    def fetch(self, url):
+        try:
+            request = Request(url, headers={'User-Agent': ARTIFACT})
+            with urlopen(request, timeout=60) as response:
+                return response.read()
+        except HTTPError as error:
+            if error.code == 404:
+                return None
+            raise ReleaseError(f'HTTP {error.code}: {url}') from error
+        except URLError as error:
+            raise ReleaseError(f'Cannot download {url}: {error.reason}') from error
+
+    def central_files(self):
+        stem = f'{ARTIFACT}-{self.version}'
+        base = ('https://repo.maven.apache.org/maven2/org/yamlstar/'
+                f'{ARTIFACT}/{self.version}/')
+        names = [stem + suffix for suffix in
+                 ('.pom', '.jar', '-sources.jar', '-javadoc.jar')]
+        return [base + name for name in names + [name + '.asc' for name in names]]
+
+    def wait_downloads(self, urls):
+        deadline = time.monotonic() + WAIT_SECONDS
+        while True:
+            files = [self.fetch(url) for url in urls]
+            if all(data is not None for data in files):
+                return files
+            if time.monotonic() >= deadline:
+                raise ReleaseError('Timed out waiting for public release downloads')
+            time.sleep(POLL_SECONDS)
+
+    def publish(self):
+        if self.command('git', 'status', '--porcelain'):
+            raise ReleaseError('Commit reviewed release sources first')
+        self.command(self.environment.get('PERL', 'perl'),
+                     'util/check-versions', self.version)
+        self.head = self.command('git', 'rev-parse', 'HEAD')
+        self.credentials()
+        if self.api('commits/' + self.head)['sha'] != self.head:
+            raise ReleaseError('The release commit is not available on GitHub')
+        for tag in (self.version, 'v' + self.version):
+            self.tag_commit(tag)
+        test_run = self.ensure_ci('test.yaml')
+        native_run = self.ensure_ci('native.yaml')
+        self.download_assets(native_run)
+        if (self.command('git', 'status', '--porcelain')
+                or self.command('git', 'rev-parse', 'HEAD') != self.head):
+            raise ReleaseError('The release checkout changed while waiting for CI')
+
+        releases = self.api('releases?per_page=100')
+        release = next((item for item in releases
+                        if item['tag_name'] == self.version), None)
+        if release is None:
+            runs_url = f'https://github.com/{REPOSITORY}/actions/runs/'
+            notes = (f'SnakeYAML parser {self.version}\n\nCommit: {self.head}\n'
+                     f'Java: org.yamlstar:{ARTIFACT}:{self.version}\n'
+                     f'Tests: {runs_url}{test_run}\n'
+                     f'Native: {runs_url}{native_run}')
+            notes_file = self.assets.parent / f'{self.version}-notes.md'
+            notes_file.write_text(notes + '\n')
+            self.github('release', 'create', self.version, '--draft',
+                        '--target', self.head, '--title',
+                        f'SnakeYAML parser {self.version}',
+                        '--notes-file', str(notes_file))
+        elif release['draft']:
+            target = self.api('commits/' + quote(release['target_commitish'], safe=''))
+            if target['sha'] != self.head:
+                raise ReleaseError('Existing draft targets a different release commit')
+        if release is None or release['draft']:
+            self.github('release', 'upload', self.version, '--clobber',
+                        *(str(self.assets / filename) for filename in self.filenames))
+
+        central = self.central_files()
+        if self.fetch(central[0]) is None:
+            self.command(self.environment.get('PERL', 'perl'), 'util/maven-release',
+                         'release', self.environment['MAVEN'],
+                         self.environment['MAVEN_REPOSITORY'], stream=True)
+        self.wait_downloads(central)
+        if release is None or release['draft']:
+            self.github('release', 'edit', self.version, '--draft=false')
+        if self.tag_commit(self.version) != self.head:
+            raise ReleaseError('GitHub release tag does not match the release commit')
+        base = f'https://github.com/{REPOSITORY}/releases/download/{self.version}/'
+        files = self.wait_downloads([base + filename for filename in self.filenames])
+        for filename, data in zip(self.filenames, files):
+            if hashlib.sha256(data).digest() != hashlib.sha256(
+                    (self.assets / filename).read_bytes()).digest():
+                raise ReleaseError(
+                    f'Public GitHub download differs from CI: {filename}')
+        if self.tag_commit('v' + self.version) is None:
+            self.api('git/refs', {'ref': 'refs/tags/v' + self.version,
+                                 'sha': self.head})
+        print(f'Released {self.version} to Central, GitHub, and Go at {self.head}')
+
+
+def main():
+    if len(sys.argv) != 2:
+        raise ReleaseError('Use make release v=VERSION')
+    Release(sys.argv[1]).publish()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ReleaseError, OSError, ValueError, KeyError, tarfile.TarError) as error:
+        sys.exit(str(error))

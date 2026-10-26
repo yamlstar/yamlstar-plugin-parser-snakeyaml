@@ -4,4 +4,5 @@
 /dist/
 /go.work
 /go.work.sum
+__pycache__/
 !/Releasing.md

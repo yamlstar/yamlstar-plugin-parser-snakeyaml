@@ -1,0 +1,434 @@
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import struct
+import subprocess
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+import xml.etree.ElementTree as ET
+
+
+ROOT = Path(__file__).resolve().parents[1]
+loader = importlib.machinery.SourceFileLoader(
+    'plugin_release', str(ROOT / 'util/release'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+HEAD = '1' * 40
+VERSION = '0.1.0'
+
+
+def make_archives(directory, wrong_architecture=False):
+    directory.mkdir()
+    for platform in module.PLATFORMS:
+        root = f'{module.ARTIFACT}-{VERSION}-{platform}'
+        extension = '.dylib' if platform.startswith('macos') else '.so'
+        if platform.startswith('linux'):
+            header = bytearray(20)
+            header[:6] = b'\x7fELF\x02\x01'
+            struct.pack_into('<H', header, 18,
+                             62 if platform == 'linux-x64' or wrong_architecture
+                             else 183)
+        else:
+            header = struct.pack('<II', 0xfeedfacf, 0x0100000c)
+        files = {
+            'plugin.edn': b'{:abi 2 :name "snakeyaml" :version "0.1.0"}',
+            'License': b'MIT',
+            'licenses/snakeyaml-engine.txt': b'Apache 2.0',
+            'lib/lib' + module.ARTIFACT + extension: bytes(header),
+        }
+        with tarfile.open(directory / (root + '.tar.xz'), 'w:xz') as archive:
+            for name, data in files.items():
+                entry = tarfile.TarInfo(root + '/' + name)
+                entry.size = len(data)
+                archive.addfile(entry, io.BytesIO(data))
+    write_checksums(directory)
+
+
+def write_checksums(directory):
+    lines = [module.hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name
+             for path in sorted(directory.glob('*.tar.xz'))]
+    (directory / 'SHA256SUMS').write_text('\n'.join(lines) + '\n')
+
+
+class Services:
+    """Model GitHub and Central while keeping all publication calls offline."""
+
+    def __init__(self, fixtures):
+        self.fixtures = fixtures
+        self.references = {}
+        self.tag_objects = {}
+        self.release = None
+        self.uploaded = {}
+        self.central = False
+        self.dirty = False
+        self.remote_head = HEAD
+        self.fail = None
+        self.corrupt_download = False
+        self.artifacts_expired = False
+        self.edit_during_ci = False
+        self.missing_once = set()
+        self.events = []
+        self.runs = {
+            'test.yaml': [self.run(10)],
+            'native.yaml': [self.run(20)],
+        }
+
+    @staticmethod
+    def run(number, status='completed', conclusion='success', head=HEAD):
+        return {'id': number, 'status': status, 'conclusion': conclusion,
+                'head_sha': head}
+
+    def command(self, *args, payload=None, stream=False):
+        if args[:3] == ('git', 'status', '--porcelain'):
+            return ' M pom.xml' if self.dirty else ''
+        if args[:3] == ('git', 'rev-parse', 'HEAD'):
+            return HEAD
+        if args[:3] == ('git', 'branch', '--show-current'):
+            return 'main'
+        if args[1] == 'util/check-versions':
+            return ''
+        if args[1] == 'util/maven-release':
+            self.events.append('central-publish')
+            if self.fail == 'central':
+                raise module.ReleaseError('Central validation failed')
+            self.central = True
+            return ''
+        if args[0] != 'fixture-gh':
+            raise AssertionError(args)
+        if args[1] == 'api':
+            endpoint = args[2].removeprefix('repos/' + module.REPOSITORY + '/')
+            return json.dumps(self.api(endpoint, payload))
+        args = args[1:-2]
+        if args[:2] == ('workflow', 'run'):
+            self.events.append('dispatch-' + args[2])
+            self.runs[args[2]].insert(0, self.run(30, 'queued', None))
+            self.artifacts_expired = False
+        elif args[:2] == ('run', 'watch'):
+            self.events.append('watch-' + args[2])
+            if self.edit_during_ci:
+                self.dirty = True
+            for runs in self.runs.values():
+                for run in runs:
+                    if str(run['id']) == args[2]:
+                        if self.fail == 'ci':
+                            raise module.ReleaseError('CI failed')
+                        run.update(status='completed', conclusion='success')
+        elif args[:2] == ('run', 'download'):
+            if self.fail == 'artifact':
+                raise module.ReleaseError('Artifact expired')
+            destination = Path(args[args.index('--dir') + 1])
+            shutil.copytree(self.fixtures, destination)
+        elif args[:2] == ('release', 'create'):
+            self.events.append('github-draft')
+            self.release = {'tag_name': VERSION, 'draft': True,
+                            'target_commitish': HEAD}
+        elif args[:2] == ('release', 'upload'):
+            self.events.append('github-upload')
+            if self.fail == 'upload':
+                raise module.ReleaseError('GitHub upload failed')
+            self.uploaded = {Path(name).name: Path(name).read_bytes()
+                             for name in args[4:]}
+        elif args[:2] == ('release', 'edit'):
+            self.events.append('github-publish')
+            if self.fail == 'github':
+                raise module.ReleaseError('GitHub publication failed')
+            self.release['draft'] = False
+            self.references[VERSION] = {'type': 'commit', 'sha': HEAD}
+        else:
+            raise AssertionError(args)
+        return ''
+
+    def api(self, endpoint, payload):
+        if endpoint.startswith('commits/'):
+            ref = endpoint.split('/')[-1]
+            return {'sha': ref if len(ref) == 40 else self.remote_head}
+        if endpoint.startswith('git/matching-refs/tags/'):
+            tag = endpoint.split('/')[-1]
+            return ([{'ref': 'refs/tags/' + tag, 'object': self.references[tag]}]
+                    if tag in self.references else [])
+        if endpoint.startswith('git/tags/'):
+            return {'object': self.tag_objects[endpoint.split('/')[-1]]}
+        if endpoint.startswith('actions/workflows/'):
+            return {'workflow_runs': self.runs[endpoint.split('/')[2]]}
+        if endpoint.endswith('/artifacts'):
+            return {'artifacts': [{'name': 'native-release',
+                                   'expired': self.artifacts_expired}]}
+        if endpoint.startswith('actions/runs/'):
+            return next(run for runs in self.runs.values() for run in runs
+                        if str(run['id']) == endpoint.split('/')[-1])
+        if endpoint.startswith('releases?'):
+            return [self.release] if self.release else []
+        if endpoint == 'git/refs':
+            self.events.append('go-tag')
+            if self.fail == 'tag':
+                raise module.ReleaseError('Go tag publication failed')
+            if payload != {'ref': 'refs/tags/v' + VERSION, 'sha': HEAD}:
+                raise AssertionError(payload)
+            self.references['v' + VERSION] = {'type': 'commit', 'sha': HEAD}
+            return {'ref': payload['ref']}
+        raise AssertionError(endpoint)
+
+    def fetch(self, url):
+        if 'repo.maven.apache.org' in url:
+            self.events.append('central-download')
+            if url in self.missing_once:
+                self.missing_once.remove(url)
+                return None
+            return b'published Java artifact' if self.central else None
+        self.events.append('native-download')
+        if self.release is None or self.release['draft']:
+            return None
+        if self.corrupt_download:
+            return b'different release artifact'
+        return self.uploaded[url.rsplit('/', 1)[-1]]
+
+
+class ReleaseTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.fixtures = self.directory / 'fixtures'
+        make_archives(self.fixtures)
+        previous = Path.cwd()
+        os.chdir(self.directory)
+        self.addCleanup(os.chdir, previous)
+        environment = patch.dict(os.environ, {
+            'GH': 'fixture-gh', 'GH_TOKEN': 'fixture-private-token',
+            'PERL': 'fixture-perl', 'MAVEN': 'fixture-maven',
+            'MAVEN_REPOSITORY': '/fixture/m2',
+        }, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.release = module.Release(VERSION)
+        self.services = Services(self.fixtures)
+        self.release.command = self.services.command
+        self.release.fetch = self.services.fetch
+        sleep = patch.object(module.time, 'sleep')
+        sleep.start()
+        self.addCleanup(sleep.stop)
+
+    def publish(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.release.publish()
+
+    def assert_no_go_tag(self):
+        self.assertNotIn('v' + VERSION, self.services.references)
+        self.assertNotIn('go-tag', self.services.events)
+
+    def test_complete_release_publishes_go_last(self):
+        self.publish()
+        events = self.services.events
+        self.assertLess(events.index('github-upload'), events.index('central-publish'))
+        self.assertLess(events.index('central-publish'),
+                        events.index('github-publish'))
+        self.assertEqual(events[-1], 'go-tag')
+        self.assertEqual(events.count('native-download'), 4)
+        self.assertEqual(set(self.services.uploaded), set(self.release.filenames))
+        self.assertEqual(self.services.references['v' + VERSION]['sha'], HEAD)
+        provenance = json.loads(Path(
+            '.cache/release-assets/0.1.0-provenance.json').read_text())
+        self.assertEqual(provenance['commit'], HEAD)
+        self.assertEqual(provenance['run'], 20)
+
+    def test_retry_reuses_published_artifacts(self):
+        self.publish()
+        self.services.events.clear()
+        self.publish()
+        for event in ('central-publish', 'github-draft', 'github-upload',
+                      'github-publish', 'go-tag'):
+            self.assertNotIn(event, self.services.events)
+
+    def test_retry_after_go_tag_failure_does_not_republish(self):
+        self.services.fail = 'tag'
+        with self.assertRaisesRegex(module.ReleaseError, 'Go tag publication'):
+            self.publish()
+        self.assertNotIn('v' + VERSION, self.services.references)
+        self.assertFalse(self.services.release['draft'])
+        self.services.fail = None
+        self.services.events.clear()
+        self.publish()
+        self.assertEqual(self.services.events[-1], 'go-tag')
+        self.assertNotIn('central-publish', self.services.events)
+        self.assertNotIn('github-publish', self.services.events)
+
+    def test_retry_after_github_failure_finishes_without_redeploying(self):
+        self.services.fail = 'github'
+        with self.assertRaisesRegex(module.ReleaseError, 'GitHub publication'):
+            self.publish()
+        self.assert_no_go_tag()
+        self.services.fail = None
+        self.services.events.clear()
+        self.publish()
+        self.assertNotIn('central-publish', self.services.events)
+        self.assertIn('go-tag', self.services.events)
+
+    def test_missing_central_files_wait_without_redeploying(self):
+        self.services.central = True
+        self.services.missing_once.add(self.release.central_files()[-1])
+        self.publish()
+        self.assertNotIn('central-publish', self.services.events)
+
+    def test_central_failure_keeps_github_draft_and_go_unpublished(self):
+        self.services.fail = 'central'
+        with self.assertRaisesRegex(module.ReleaseError, 'Central validation'):
+            self.publish()
+        self.assertTrue(self.services.release['draft'])
+        self.assert_no_go_tag()
+
+    def test_upload_failure_stops_before_central(self):
+        self.services.fail = 'upload'
+        with self.assertRaisesRegex(module.ReleaseError, 'GitHub upload'):
+            self.publish()
+        self.assertNotIn('central-publish', self.services.events)
+        self.assert_no_go_tag()
+
+    def test_public_native_mismatch_blocks_go_tag(self):
+        self.services.corrupt_download = True
+        with self.assertRaisesRegex(module.ReleaseError, 'differs from CI'):
+            self.publish()
+        self.assert_no_go_tag()
+
+    def test_checksum_failure_stops_before_publishing(self):
+        archive = next(self.fixtures.glob('*.tar.xz'))
+        archive.write_bytes(b'corrupt archive')
+        with self.assertRaisesRegex(module.ReleaseError, 'Checksum mismatch'):
+            self.publish()
+        self.assertFalse(self.services.events)
+        self.assert_no_go_tag()
+
+    def test_missing_platform_stops_before_publishing(self):
+        next(self.fixtures.glob('*.tar.xz')).unlink()
+        with self.assertRaisesRegex(module.ReleaseError, 'all three archives'):
+            self.publish()
+        self.assert_no_go_tag()
+
+    def test_wrong_architecture_with_valid_checksum_is_rejected(self):
+        shutil.rmtree(self.fixtures)
+        make_archives(self.fixtures, wrong_architecture=True)
+        with self.assertRaisesRegex(module.ReleaseError, 'Wrong native architecture'):
+            self.publish()
+        self.assert_no_go_tag()
+        self.assertIsNone(self.services.release)
+
+    def test_missing_ci_is_dispatched_and_waited_for(self):
+        self.services.runs['native.yaml'] = []
+        self.publish()
+        self.assertIn('dispatch-native.yaml', self.services.events)
+        self.assertIn('watch-30', self.services.events)
+
+    def test_old_failed_run_is_not_confused_with_new_dispatch(self):
+        self.services.runs['native.yaml'] = [
+            self.services.run(20, conclusion='failure')]
+        self.publish()
+        self.assertIn('watch-30', self.services.events)
+        self.assertNotIn('watch-20', self.services.events)
+
+    def test_expired_native_artifacts_are_rebuilt(self):
+        self.services.artifacts_expired = True
+        self.publish()
+        self.assertIn('dispatch-native.yaml', self.services.events)
+        self.assertIn('watch-30', self.services.events)
+
+    def test_pending_ci_failure_stops_before_publishing(self):
+        self.services.runs['native.yaml'] = [
+            self.services.run(20, 'in_progress', None)]
+        self.services.fail = 'ci'
+        with self.assertRaisesRegex(module.ReleaseError, 'CI failed'):
+            self.publish()
+        self.assert_no_go_tag()
+        self.assertIsNone(self.services.release)
+
+    def test_ci_for_another_commit_is_not_accepted(self):
+        self.services.runs['native.yaml'] = [self.services.run(20, head='2' * 40)]
+        self.services.remote_head = '2' * 40
+        with self.assertRaisesRegex(module.ReleaseError, 'does not match HEAD'):
+            self.publish()
+        self.assert_no_go_tag()
+
+    def test_conflicting_remote_tag_is_not_replaced(self):
+        self.services.references['v' + VERSION] = {'type': 'commit', 'sha': '2' * 40}
+        with self.assertRaisesRegex(module.ReleaseError,
+                                    'does not match release commit'):
+            self.publish()
+        self.assertFalse(self.services.events)
+
+    def test_existing_annotated_tag_is_peeled(self):
+        self.services.references[VERSION] = {'type': 'tag', 'sha': '3' * 40}
+        self.services.tag_objects['3' * 40] = {'type': 'commit', 'sha': HEAD}
+        self.publish()
+        self.assertIn('go-tag', self.services.events)
+
+    def test_dirty_checkout_stops_before_services(self):
+        self.services.dirty = True
+        with self.assertRaisesRegex(module.ReleaseError, 'Commit reviewed'):
+            self.publish()
+        self.assertFalse(self.services.events)
+
+    def test_checkout_changes_during_ci_stop_before_publication(self):
+        self.services.runs['native.yaml'] = [
+            self.services.run(20, 'in_progress', None)]
+        self.services.edit_during_ci = True
+        with self.assertRaisesRegex(module.ReleaseError, 'checkout changed'):
+            self.publish()
+        self.assert_no_go_tag()
+        self.assertIsNone(self.services.release)
+
+    def test_wrong_draft_commit_is_not_reused(self):
+        self.services.release = {'tag_name': VERSION, 'draft': True,
+                                 'target_commitish': '2' * 40}
+        with self.assertRaisesRegex(module.ReleaseError, 'different release commit'):
+            self.publish()
+        self.assert_no_go_tag()
+
+    def test_existing_draft_branch_resolves_to_reviewed_commit(self):
+        self.services.release = {'tag_name': VERSION, 'draft': True,
+                                 'target_commitish': 'main'}
+        self.publish()
+        self.assertIn('go-tag', self.services.events)
+
+    def test_github_credentials_use_yamlstar_secret_file(self):
+        del self.release.environment['GH_TOKEN']
+        secrets = self.directory / 'secrets.yaml'
+        secrets.write_text('github:\n  token: fixture-private-token\n')
+        self.release.environment['YS_SECRETS_FILE'] = str(secrets)
+        completed = subprocess.CompletedProcess([], 0, 'fixture-private-token\n')
+        with patch.object(module.subprocess, 'run', return_value=completed) as call:
+            self.release.credentials()
+        self.assertEqual(self.release.environment['GH_TOKEN'], 'fixture-private-token')
+        self.assertIn('github.token', call.call_args.args[0][2])
+        self.assertEqual(call.call_args.kwargs['stderr'], subprocess.DEVNULL)
+
+    def test_git_reference_request_uses_json_and_private_environment(self):
+        release = module.Release(VERSION)
+        payload = {'ref': 'refs/tags/v' + VERSION, 'sha': HEAD}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(payload))
+        with patch.object(module.subprocess, 'run', return_value=completed) as call:
+            self.assertEqual(release.api('git/refs', payload), payload)
+        self.assertEqual(json.loads(call.call_args.kwargs['input']), payload)
+        arguments = call.call_args.args[0]
+        self.assertEqual(arguments[-4:], ('--method', 'POST', '--input', '-'))
+        self.assertNotIn('fixture-private-token', str(arguments))
+        self.assertEqual(call.call_args.kwargs['env']['GH_TOKEN'],
+                         'fixture-private-token')
+
+    def test_central_configuration_waits_for_automatic_publication(self):
+        pom = ET.parse(ROOT / 'pom.xml')
+        ns = {'m': 'http://maven.apache.org/POM/4.0.0'}
+        configuration = pom.find(
+            './/m:plugin[m:artifactId="central-publishing-maven-plugin"]/'
+            'm:configuration', ns)
+        self.assertEqual(configuration.find('m:autoPublish', ns).text, 'true')
+        self.assertEqual(configuration.find('m:waitUntil', ns).text, 'published')
+
+
+if __name__ == '__main__':
+    unittest.main()

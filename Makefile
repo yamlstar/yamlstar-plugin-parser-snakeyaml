@@ -16,6 +16,7 @@ include $M/go.mk
 include $M/perl.mk
 include $M/yamlscript.mk
 include $M/python.mk
+include $M/gh.mk
 include $M/shellcheck.mk
 include $M/shell.mk
 
@@ -145,22 +146,10 @@ release-check: check-versions $(PERL)
 	@test -z "$$(git status --porcelain)" || { \
 	  echo 'Commit reviewed release sources first' >&2; exit 1; }
 
-release-tags: release-check dist
-	@for tag in $(VERSION) v$(VERSION); do \
-	  if git show-ref --verify --quiet refs/tags/$$tag; then \
-	    test "$$(git rev-parse "$$tag^{commit}")" = \
-	      "$$(git rev-parse HEAD)" || { \
-	        echo "Tag $$tag does not match HEAD" >&2; exit 1; }; \
-	  fi; \
-	done
-	@for tag in $(VERSION) v$(VERSION); do \
-	  git show-ref --verify --quiet refs/tags/$$tag || \
-	    git tag -a $$tag -m 'Release $(VERSION)'; \
-	done
+release: release-check $(MAVEN) $(PERL) $(YS) $(PYTHON) $(GH)
+	YS=$(YS) GH=$(GH) PERL=$(PERL) MAVEN=$(MAVEN) \
+	  MAVEN_REPOSITORY=$(MAVEN-REPOSITORY) $(PYTHON) util/release '$(v)'
 
-release: release-check dist release-tags $(MAVEN) $(PERL) $(YS)
-	YS=$(YS) $(PERL) util/maven-release release \
-	  $(MAVEN) $(MAVEN-REPOSITORY) -DskipTests
-
-test-release: $(PERL) $(YS)
+test-release: $(PERL) $(YS) $(PYTHON)
 	YS=$(YS) $(PERL) test/maven-release.t
+	$(PYTHON) -m unittest discover -s test -p '*_test.py'
